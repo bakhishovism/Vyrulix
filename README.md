@@ -28,7 +28,7 @@
 For reverse-engineers testing inside disposable virtual machines, Vyrulix is packaged as a portable executable with zero Python dependencies required.
 
 1. Navigate to the **[Releases](../../releases)** tab.
-2. Download `Vyrulix-v1.1-win64.zip` and verify its SHA-256 hash against the release notes.
+2. Download `Vyrulix-v1.2-win64.zip` and verify its SHA-256 hash against the release notes.
 3. Extract the entire folder (keep `Vyrulix.exe` alongside its `_internal` directory) and run `Vyrulix.exe`.
 4. *(Optional)* Click **⚙** in the top navigation bar to add your VirusTotal v3 API key or abuse.ch Auth-Key.
 
