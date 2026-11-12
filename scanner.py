@@ -105,15 +105,6 @@ except ImportError:
     Observer = None
     WATCHDOG_AVAILABLE = False
 
-try:
-    import capa.main as capa_main  # type: ignore
-    import capa.rules as capa_rules  # type: ignore
-
-    CAPA_AVAILABLE = True
-except ImportError:
-    capa_main = None
-    capa_rules = None
-    CAPA_AVAILABLE = False
 
 try:
     import ssdeep as _native_ssdeep  # type: ignore
@@ -629,8 +620,15 @@ class ZeroCopyMappedFile:
                 k32.CloseHandle.argtypes = [ctypes.c_void_p]
                 k32.CloseHandle.restype = ctypes.c_int
 
+                win32_path = self.filepath
+                if not win32_path.startswith("\\\\?\\"):
+                    if win32_path.startswith("\\\\"):
+                        win32_path = "\\\\?\\UNC\\" + win32_path.lstrip("\\")
+                    else:
+                        win32_path = "\\\\?\\" + win32_path
+
                 h_file = k32.CreateFileW(
-                    self.filepath,
+                    win32_path,
                     self.GENERIC_READ,
                     self.FILE_SHARE_ALL,
                     None,
@@ -952,11 +950,11 @@ def verify_authenticode_signature(
             wvt_data = _WINTRUST_DATA()
             wvt_data.cbStruct = ctypes.sizeof(_WINTRUST_DATA)
             wvt_data.dwUIChoice = 2          # WTD_UI_NONE
-            wvt_data.fdwRevocationChecks = 0 # WTD_REVOKE_NONE (fast offline-safe chain check)
+            wvt_data.fdwRevocationChecks = 1 # WTD_REVOKE_WHOLECHAIN (enforce full chain revocation check)
             wvt_data.dwUnionChoice = 1       # WTD_CHOICE_FILE
             wvt_data.pFile = ctypes.pointer(file_info)
             wvt_data.dwStateAction = 1       # WTD_STATEACTION_VERIFY
-            wvt_data.dwProvFlags = 0x00000010 | 0x00000400  # WTD_SAFER_FLAG | WTD_CACHE_ONLY_URL_RETRIEVAL
+            wvt_data.dwProvFlags = 0x00000010  # WTD_SAFER_FLAG
 
             status = wintrust.WinVerifyTrust(
                 None, ctypes.byref(action_guid), ctypes.byref(wvt_data)
@@ -967,16 +965,41 @@ def verify_authenticode_signature(
                 None, ctypes.byref(action_guid), ctypes.byref(wvt_data)
             )
 
+            status_u32 = status & 0xFFFFFFFF
             if status == 0:
                 return (
                     True,
                     "Valid (WinVerifyTrust Chain Verified)",
                     signer_subject or "Trusted Authenticode Publisher",
                 )
+
+            # In air-gapped or host-only forensic VMs, online CRL/OCSP lookup returns
+            # CERT_E_REVOCATION_FAILURE (0x80092012) or CRYPT_E_REVOCATION_OFFLINE (0x80092013).
+            # Retry using local cache only (never bypassing CERT_E_REVOKED = 0x80092010).
+            if status_u32 in (0x80092012, 0x80092013):
+                wvt_data.fdwRevocationChecks = 0             # WTD_REVOKE_NONE
+                wvt_data.dwStateAction = 1                   # WTD_STATEACTION_VERIFY
+                wvt_data.dwProvFlags = 0x00000010 | 0x00000400  # WTD_SAFER_FLAG | WTD_CACHE_ONLY_URL_RETRIEVAL
+                retry_status = wintrust.WinVerifyTrust(
+                    None, ctypes.byref(action_guid), ctypes.byref(wvt_data)
+                )
+                wvt_data.dwStateAction = 2                   # WTD_STATEACTION_CLOSE
+                wintrust.WinVerifyTrust(
+                    None, ctypes.byref(action_guid), ctypes.byref(wvt_data)
+                )
+                if retry_status == 0:
+                    return (
+                        True,
+                        "Valid (WinVerifyTrust Chain Verified - Offline Revocation Cache)",
+                        signer_subject or "Trusted Authenticode Publisher",
+                    )
+                status = retry_status
+                status_u32 = retry_status & 0xFFFFFFFF
+
             if has_security_dir:
                 return (
                     False,
-                    f"Invalid / Untrusted Chain (WinVerifyTrust 0x{status & 0xFFFFFFFF:08X})",
+                    f"Invalid / Untrusted Chain (WinVerifyTrust 0x{status_u32:08X})",
                     signer_subject or "Untrusted / Self-Signed / Expired Certificate",
                 )
             return False, "Unsigned", ""
@@ -1012,6 +1035,7 @@ def _native_decode_x86_stream(
     """
     REG64 = ("rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15")
     REG32 = ("eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi", "r8d", "r9d", "r10d", "r11d", "r12d", "r13d", "r14d", "r15d")
+    REG16 = ("ax", "cx", "dx", "bx", "sp", "bp", "si", "di", "r8w", "r9w", "r10w", "r11w", "r12w", "r13w", "r14w", "r15w")
     REG8 = ("al", "cl", "dl", "bl", "ah", "ch", "dh", "bh")
     JCC_NAMES = {
         0x70: "jo", 0x71: "jno", 0x72: "jb", 0x73: "jae", 0x74: "je", 0x75: "jne",
@@ -1025,7 +1049,7 @@ def _native_decode_x86_stream(
     idx = 0
     n = len(code_bytes)
 
-    def _consume_modrm(pos: int, rex_b: int, rex_r: int, rex_w: int, seg_prefix: str, is_byte: bool = False) -> Tuple[int, str, str]:
+    def _consume_modrm(pos: int, rex_b: int, rex_r: int, rex_w: int, seg_prefix: str, is_byte: bool = False, is_word: bool = False) -> Tuple[int, str, str]:
         if pos >= n:
             return pos, "?", "?"
         modrm = code_bytes[pos]
@@ -1033,7 +1057,7 @@ def _native_decode_x86_stream(
         mod = (modrm >> 6) & 3
         reg_idx = ((modrm >> 3) & 7) | (8 if rex_r else 0)
         rm_idx = (modrm & 7) | (8 if rex_b else 0)
-        reg_table = REG8 if is_byte else (REG64 if (is_64bit and rex_w) else REG32)
+        reg_table = REG8 if is_byte else (REG64 if (is_64bit and rex_w) else (REG16 if is_word else REG32))
         ptr_table = REG64 if is_64bit else REG32
         reg_name = reg_table[reg_idx % len(reg_table)]
 
@@ -1078,7 +1102,7 @@ def _native_decode_x86_stream(
             pos += 4
             disp_str = f"+{disp:#x}" if disp >= 0 else f"-{abs(disp):#x}"
 
-        sz_lbl = "byte ptr" if is_byte else ("qword ptr" if (is_64bit and rex_w) else "dword ptr")
+        sz_lbl = "byte ptr" if is_byte else ("qword ptr" if (is_64bit and rex_w) else ("word ptr" if is_word else "dword ptr"))
         seg_str = f"{seg_prefix}:" if seg_prefix else ""
         return pos, reg_name, f"{sz_lbl} {seg_str}[{base_reg}{disp_str}]"
 
@@ -1128,8 +1152,9 @@ def _native_decode_x86_stream(
         idx += 1
         mnem = "db"
         operands = f"{op:#04x}"
-        gpr_list = REG64 if is_64bit else REG32
-        val_list = REG64 if (is_64bit and rex_w) else REG32
+        is_16bit_op = bool(op_size_override and not rex_w)
+        gpr_list = REG16 if is_16bit_op else (REG64 if is_64bit else REG32)
+        val_list = REG64 if (is_64bit and rex_w) else (REG16 if is_16bit_op else REG32)
 
         if op == 0x90:
             mnem, operands = ("pause", "") if rep_prefix == "rep " else ("nop", "")
@@ -1163,16 +1188,25 @@ def _native_decode_x86_stream(
             imm8 = struct.unpack_from("<b", code_bytes, idx)[0]
             idx += 1
             mnem, operands = "push", f"{imm8:#x}"
-        elif op == 0x68 and idx + 4 <= n:
-            imm32 = struct.unpack_from("<I", code_bytes, idx)[0]
-            idx += 4
-            mnem, operands = "push", f"{imm32:#x}"
+        elif op == 0x68:
+            if is_16bit_op and idx + 2 <= n:
+                imm16 = struct.unpack_from("<H", code_bytes, idx)[0]
+                idx += 2
+                mnem, operands = "push", f"{imm16:#x}"
+            elif idx + 4 <= n:
+                imm32 = struct.unpack_from("<I", code_bytes, idx)[0]
+                idx += 4
+                mnem, operands = "push", f"{imm32:#x}"
         elif 0xB8 <= op <= 0xBF:
             reg_name = val_list[(op - 0xB8) | (8 if rex_b else 0)]
             if is_64bit and rex_w and idx + 8 <= n:
                 imm64 = struct.unpack_from("<Q", code_bytes, idx)[0]
                 idx += 8
                 mnem, operands = "movabs", f"{reg_name}, {imm64:#x}"
+            elif is_16bit_op and idx + 2 <= n:
+                imm16 = struct.unpack_from("<H", code_bytes, idx)[0]
+                idx += 2
+                mnem, operands = "mov", f"{reg_name}, {imm16:#x}"
             elif idx + 4 <= n:
                 imm32 = struct.unpack_from("<I", code_bytes, idx)[0]
                 idx += 4
@@ -1183,9 +1217,9 @@ def _native_decode_x86_stream(
             mnem, operands = "mov", f"{REG8[op - 0xB0]}, {imm8:#x}"
         elif op in (0x88, 0x89, 0x8A, 0x8B, 0x8D):
             is_b = op in (0x88, 0x8A)
-            idx, reg_n, rm_n = _consume_modrm(idx, rex_b, rex_r, rex_w, seg_override, is_byte=is_b)
+            idx, reg_n, rm_n = _consume_modrm(idx, rex_b, rex_r, rex_w, seg_override, is_byte=is_b, is_word=(is_16bit_op and not is_b))
             if op == 0x8D:
-                mnem, operands = "lea", f"{reg_n}, {rm_n.replace('qword ptr ', '').replace('dword ptr ', '')}"
+                mnem, operands = "lea", f"{reg_n}, {rm_n.replace('qword ptr ', '').replace('dword ptr ', '').replace('word ptr ', '')}"
             elif op in (0x88, 0x89):
                 mnem, operands = "mov", f"{rm_n}, {reg_n}"
             else:
@@ -1194,20 +1228,24 @@ def _native_decode_x86_stream(
             alu_op = ALU_NAMES[(op >> 3) & 7]
             is_b = (op & 1) == 0
             to_reg = (op & 2) != 0
-            idx, reg_n, rm_n = _consume_modrm(idx, rex_b, rex_r, rex_w, seg_override, is_byte=is_b)
+            idx, reg_n, rm_n = _consume_modrm(idx, rex_b, rex_r, rex_w, seg_override, is_byte=is_b, is_word=(is_16bit_op and not is_b))
             mnem = alu_op
             operands = f"{reg_n}, {rm_n}" if to_reg else f"{rm_n}, {reg_n}"
         elif op == 0x85:
-            idx, reg_n, rm_n = _consume_modrm(idx, rex_b, rex_r, rex_w, seg_override, is_byte=False)
+            idx, reg_n, rm_n = _consume_modrm(idx, rex_b, rex_r, rex_w, seg_override, is_byte=False, is_word=is_16bit_op)
             mnem, operands = "test", f"{rm_n}, {reg_n}"
         elif op in (0x80, 0x81, 0x83) and idx < n:
             sub_op = (code_bytes[idx] >> 3) & 7
             is_b = op == 0x80
-            idx, _, rm_n = _consume_modrm(idx, rex_b, rex_r, rex_w, seg_override, is_byte=is_b)
+            idx, _, rm_n = _consume_modrm(idx, rex_b, rex_r, rex_w, seg_override, is_byte=is_b, is_word=(is_16bit_op and not is_b))
             mnem = ALU_NAMES[sub_op]
             if op in (0x80, 0x83) and idx < n:
                 imm = struct.unpack_from("<b", code_bytes, idx)[0]
                 idx += 1
+                operands = f"{rm_n}, {imm:#x}"
+            elif op == 0x81 and is_16bit_op and idx + 2 <= n:
+                imm = struct.unpack_from("<H", code_bytes, idx)[0]
+                idx += 2
                 operands = f"{rm_n}, {imm:#x}"
             elif op == 0x81 and idx + 4 <= n:
                 imm = struct.unpack_from("<i", code_bytes, idx)[0]
@@ -1216,7 +1254,7 @@ def _native_decode_x86_stream(
         elif op in (0xC0, 0xC1, 0xD0, 0xD1, 0xD2, 0xD3) and idx < n:
             sub_op = (code_bytes[idx] >> 3) & 7
             is_b = (op & 1) == 0
-            idx, _, rm_n = _consume_modrm(idx, rex_b, rex_r, rex_w, seg_override, is_byte=is_b)
+            idx, _, rm_n = _consume_modrm(idx, rex_b, rex_r, rex_w, seg_override, is_byte=is_b, is_word=(is_16bit_op and not is_b))
             mnem = SHIFT_NAMES[sub_op]
             if op in (0xC0, 0xC1) and idx < n:
                 imm8 = code_bytes[idx]
@@ -1228,11 +1266,15 @@ def _native_decode_x86_stream(
                 operands = f"{rm_n}, cl"
         elif op in (0xC6, 0xC7) and idx < n:
             is_b = op == 0xC6
-            idx, _, rm_n = _consume_modrm(idx, rex_b, rex_r, rex_w, seg_override, is_byte=is_b)
+            idx, _, rm_n = _consume_modrm(idx, rex_b, rex_r, rex_w, seg_override, is_byte=is_b, is_word=(is_16bit_op and not is_b))
             mnem = "mov"
             if is_b and idx < n:
                 imm = code_bytes[idx]
                 idx += 1
+                operands = f"{rm_n}, {imm:#x}"
+            elif not is_b and is_16bit_op and idx + 2 <= n:
+                imm = struct.unpack_from("<H", code_bytes, idx)[0]
+                idx += 2
                 operands = f"{rm_n}, {imm:#x}"
             elif not is_b and idx + 4 <= n:
                 imm = struct.unpack_from("<I", code_bytes, idx)[0]
@@ -2250,9 +2292,26 @@ class WindowsSandboxDetonator:
         )
 
     @staticmethod
-    def build_monitor_ps1(sample_filename: str, poll_window_sec: int = SANDBOX_POLL_WINDOW_SEC) -> str:
+    def sanitize_sandbox_sample_name(filepath_or_name: str) -> str:
+        """
+        Returns a static, command-injection-safe filename (`target_sample.<ext>`)
+        using only a strictly validated lowercase alphanumeric extension (or `.bin`).
+        Never preserves untrusted user filenames inside the sandbox or PowerShell script.
+        """
+        raw_ext = os.path.splitext(os.path.basename(str(filepath_or_name or "")))[1].lower()
+        safe_ext = raw_ext if re.fullmatch(r"\.[a-z0-9]{1,8}", raw_ext) else ".bin"
+        return f"target_sample{safe_ext}"
+
+    @classmethod
+    def build_monitor_ps1(
+        cls,
+        sample_filename: str = "target_sample.exe",
+        poll_window_sec: int = SANDBOX_POLL_WINDOW_SEC,
+    ) -> str:
         """
         Generates a hardened PowerShell behavioral monitor for Windows Sandbox:
+          - Uses a static, sanitized target filename (`target_sample.<ext>`) and never
+            interpolates raw user filenames into PowerShell code.
           - Dispatches execution based on file extension (`.exe`, `.msi`, `.bat`, `.cmd`, `.vbs`, `.js`, `.hta`, `.ps1`, `.dll`).
           - Enforces a precise 15.0-second (`15000ms` via `[System.Diagnostics.Stopwatch]` and 60 x 250ms ticks)
             high-frequency polling window that NEVER aborts early when the initial parent dropper terminates,
@@ -2262,12 +2321,12 @@ class WindowsSandboxDetonator:
           - Tracks newly dropped executable/script artifacts in `%TEMP%`, `%APPDATA%`, and `Startup`.
           - Atomically flushes `telemetry.json` via `.tmp` rename + UTF-8 flush.
         """
-        clean_name = sample_filename.replace("'", "")
+        static_sample_name = cls.sanitize_sandbox_sample_name(sample_filename)
         total_ms = max(5000, int(poll_window_sec) * 1000)
         tick_count = total_ms // 250
         return (
             "$ErrorActionPreference = 'SilentlyContinue'\n"
-            f"$samplePath = Join-Path 'C:\\Users\\WDAGUtilityAccount\\Desktop\\VyrulixSample' '{clean_name}'\n"
+            f"$samplePath = Join-Path 'C:\\Users\\WDAGUtilityAccount\\Desktop\\VyrulixSample' '{static_sample_name}'\n"
             "$outDir = 'C:\\Users\\WDAGUtilityAccount\\Desktop\\VyrulixTelemetry'\n"
             "$tmpPath = Join-Path $outDir 'telemetry.json.tmp'\n"
             "$outPath = Join-Path $outDir 'telemetry.json'\n"
@@ -2377,7 +2436,7 @@ class WindowsSandboxDetonator:
     def detonate_sample(
         cls,
         filepath: str,
-        timeout_sec: int = 35,
+        timeout_sec: int = 70,
         status_callback: Optional[Callable[[str], None]] = None,
     ) -> SandboxDetonationReport:
         abs_path = os.path.abspath(filepath)
@@ -2395,13 +2454,13 @@ class WindowsSandboxDetonator:
         sample_dir.mkdir(parents=True, exist_ok=True)
         telemetry_dir.mkdir(parents=True, exist_ok=True)
 
-        sample_name = os.path.basename(abs_path)
-        staged_sample = sample_dir / sample_name
+        static_sample_name = cls.sanitize_sandbox_sample_name(abs_path)
+        staged_sample = sample_dir / static_sample_name
         shutil.copy2(abs_path, staged_sample)
 
         ps1_path = sample_dir / "vyrulix_sandbox_monitor.ps1"
         ps1_path.write_text(
-            cls.build_monitor_ps1(sample_name, poll_window_sec=SANDBOX_POLL_WINDOW_SEC),
+            cls.build_monitor_ps1(static_sample_name, poll_window_sec=SANDBOX_POLL_WINDOW_SEC),
             encoding="utf-8",
         )
 
@@ -2430,7 +2489,7 @@ class WindowsSandboxDetonator:
             try:
                 proc = subprocess.Popen([wsb_exe, str(wsb_path)])
                 waited = 0.0
-                effective_timeout = max(timeout_sec, SANDBOX_POLL_WINDOW_SEC + 15)
+                effective_timeout = max(timeout_sec, SANDBOX_POLL_WINDOW_SEC + 45)
                 while waited < effective_timeout:
                     if telemetry_file.is_file() and telemetry_file.stat().st_size > 0:
                         break
@@ -2440,6 +2499,17 @@ class WindowsSandboxDetonator:
                     proc.terminate()
                 except Exception:
                     pass
+                for sb_image in ("WindowsSandbox.exe", "WindowsSandboxClient.exe"):
+                    try:
+                        subprocess.run(
+                            ["taskkill", "/F", "/IM", sb_image],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            timeout=5,
+                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                        )
+                    except Exception:
+                        pass
             except Exception as exc:
                 return SandboxDetonationReport(
                     executed=False,
@@ -2843,7 +2913,7 @@ def update_opensource_yara_ruleset(
         logger.info("Starting manual YARA sync from %s (%s)", repo_label, zip_url)
         req = urllib.request.Request(
             zip_url,
-            headers={"User-Agent": "Vyrulix-ManualYaraSync/1.0"},
+            headers={"User-Agent": "Vyrulix-ManualYaraSync/1.1"},
         )
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -3012,7 +3082,7 @@ def _query_malwarebazaar_http_once(
     headers = {
         "Content-Type": "application/x-www-form-urlencoded",
         "Accept": "application/json",
-        "User-Agent": "Vyrulix-TriageSuite/1.0",
+        "User-Agent": "Vyrulix-TriageSuite/1.1",
     }
     if auth_key:
         headers["Auth-Key"] = auth_key
@@ -3084,7 +3154,7 @@ def _query_threatfox_http_once(
     headers = {
         "Content-Type": "application/json",
         "Accept": "application/json",
-        "User-Agent": "Vyrulix-TriageSuite/1.0",
+        "User-Agent": "Vyrulix-TriageSuite/1.1",
     }
     if auth_key:
         headers["Auth-Key"] = auth_key
@@ -3162,7 +3232,7 @@ def _query_malwarebazaar_imphash_http_once(
     headers = {
         "Content-Type": "application/x-www-form-urlencoded",
         "Accept": "application/json",
-        "User-Agent": "Vyrulix-TriageSuite/1.0",
+        "User-Agent": "Vyrulix-TriageSuite/1.1",
     }
     if auth_key:
         headers["Auth-Key"] = auth_key
@@ -3347,7 +3417,7 @@ def _query_virustotal_v3_http_once(
         headers={
             "x-apikey": resolved_key,
             "Accept": "application/json",
-            "User-Agent": "Vyrulix-Scanner/1.0",
+            "User-Agent": "Vyrulix-Scanner/1.1",
         },
         method="GET",
     )
@@ -3515,7 +3585,7 @@ def _upload_file_to_vt_v3_http_once(
     headers_base = {
         "x-apikey": resolved_key,
         "Accept": "application/json",
-        "User-Agent": "Vyrulix-Scanner/1.0",
+        "User-Agent": "Vyrulix-Scanner/1.1",
     }
 
     try:
@@ -3567,7 +3637,7 @@ def _poll_vt_v3_analysis_once(
         headers={
             "x-apikey": resolved_key,
             "Accept": "application/json",
-            "User-Agent": "Vyrulix-Scanner/1.0",
+            "User-Agent": "Vyrulix-Scanner/1.1",
         },
         method="GET",
     )
@@ -4477,7 +4547,7 @@ class VyrulixScanner:
     def detonate_in_windows_sandbox(
         self,
         report: ScanReport,
-        timeout_sec: int = 35,
+        timeout_sec: int = 70,
         status_callback: Optional[StatusCallback] = None,
     ) -> ScanReport:
         sbx = WindowsSandboxDetonator.detonate_sample(

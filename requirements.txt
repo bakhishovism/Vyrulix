@@ -2,7 +2,6 @@ customtkinter==5.2.2
 capstone>=5.0.1
 pefile==2023.2.7
 ppdeep>=1.1
-flare-capa>=7.0.0; python_version < "3.14"
 py-tlsh>=4.7.2; python_version < "3.14"
 yara-python>=4.5.0; python_version < "3.14"
 watchdog>=4.0.1

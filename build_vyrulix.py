@@ -1,13 +1,13 @@
 """
-Vyrulix v1.0 - Canonical Spec Normalization & PyInstaller 6.x Builder (build_vyrulix.py)
-Rebranded to Vyrulix (v1.0):
+Vyrulix v1.1 - Canonical Spec Normalization & PyInstaller 6.x Builder (build_vyrulix.py)
+Rebranded to Vyrulix (v1.1):
   1. Normalizes legacy or misnamed project files (`scanner_2.py` -> `scanner.py`,
      `main_2.py` -> `main.py`, `community_2.py` -> `community.py`) prior to build.
   2. Verifies that `main.py`, `scanner.py`, `community.py`, and `rules/vyrulix_default.yar`
      are present and valid.
   3. Generates `Vyrulix.spec` targeting the canonical entry point `main.py` and bundling
      `community.py`, `scanner.py`, `rules/`, and all dynamic runtime libraries
-     (`customtkinter`, `capstone`, `pefile`, `yara`, `ppdeep`, `ssdeep`, `tlsh`, `capa`,
+     (`customtkinter`, `capstone`, `pefile`, `yara`, `ppdeep`, `ssdeep`, `tlsh`,
      `watchdog`, `plyer`) to produce `dist/Vyrulix/Vyrulix.exe`.
 Usage:
     python build_vyrulix.py
@@ -22,10 +22,10 @@ from pathlib import Path
 
 SPEC_CONTENT = r'''# -*- mode: python ; coding: utf-8 -*-
 """
-PyInstaller 6.x Specification File for Vyrulix v1.0 (Vyrulix.spec)
+PyInstaller 6.x Specification File for Vyrulix v1.1 (Vyrulix.spec)
 Targets canonical entry point `main.py` and bundles `community.py`, `scanner.py`,
 `rules/`, and all dynamic forensic runtime libraries (`customtkinter`, `capstone`,
-`pefile`, `yara`, `ppdeep`, `ssdeep`, `tlsh`, `capa`, `watchdog`, `plyer`).
+`pefile`, `yara`, `ppdeep`, `ssdeep`, `tlsh`, `watchdog`, `plyer`).
 Build command:
     python -m PyInstaller --noconfirm --clean Vyrulix.spec
 """
@@ -79,12 +79,8 @@ datas = [
     (str(project_dir / "community.py"), "."),
     (str(project_dir / "scanner.py"), "."),
 ]
-for pkg in ("customtkinter", "capstone", "pefile", "yara", "ppdeep", "tlsh", "capa"):
+for pkg in ("customtkinter", "capstone", "pefile", "yara", "ppdeep", "tlsh"):
     datas += _safe_collect_data(pkg)
-
-capa_rules_dir = project_dir / "capa_rules"
-if capa_rules_dir.is_dir():
-    datas.append((str(capa_rules_dir), "capa_rules"))
 
 # Collect native C-extension shared libraries / DLLs for capstone, yara, ppdeep, tlsh
 binaries = []
@@ -101,7 +97,6 @@ hiddenimports = [
     "ppdeep",
     "ssdeep",
     "tlsh",
-    "capa",
     "watchdog",
     "watchdog.observers",
     "watchdog.events",
@@ -110,7 +105,7 @@ hiddenimports = [
     "plyer.platforms.macosx.notification",
     "plyer.platforms.linux.notification",
 ]
-for mod_pkg in ("customtkinter", "capstone", "plyer", "capa"):
+for mod_pkg in ("customtkinter", "capstone", "plyer"):
     hiddenimports += _safe_collect_submodules(mod_pkg)
 
 a = Analysis(
@@ -170,10 +165,13 @@ def normalize_project_filenames(project_dir: Path) -> None:
     ]
     for canonical_name, aliases in normalization_map:
         canonical_path = project_dir / canonical_name
-        if not canonical_path.is_file():
-            for alias in aliases:
-                alias_path = project_dir / alias
-                if alias_path.is_file():
+        for alias in aliases:
+            alias_path = project_dir / alias
+            if alias_path.is_file():
+                if (
+                    not canonical_path.is_file()
+                    or alias_path.stat().st_mtime >= canonical_path.stat().st_mtime
+                ):
                     shutil.copy2(str(alias_path), str(canonical_path))
                     print(f"[+] Normalized '{alias}' -> '{canonical_name}'")
                     break
@@ -195,7 +193,7 @@ def main() -> None:
     print(f"[+] Wrote canonical PyInstaller spec: {spec_path}")
 
     cmd = [sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean", str(spec_path)]
-    print(f"[+] Executing Vyrulix v1.0 build: {' '.join(cmd)}")
+    print(f"[+] Executing Vyrulix v1.1 build: {' '.join(cmd)}")
     subprocess.run(cmd, cwd=str(project_dir), check=True)
 
 

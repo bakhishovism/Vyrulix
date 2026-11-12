@@ -1,22 +1,24 @@
 """
-Vyrulix - Local-First & API-Isolated Community Intelligence Manager (community.py)
+Vyrulix v1.1 - Local-First & API-Isolated Community Intelligence Manager (community.py)
 Forensic Audit Remediated Release:
   1. Canonical Local-First Storage (`~/.vyrulix/community.json`):
      - Stores comments, user accounts, and reputation tallies in `~/.vyrulix/community.json`
        using atomic file writes (`tempfile.mkstemp` + `os.fsync` + `os.replace`) so power loss
        or concurrent threads never corrupt the JSON store.
      - Automatically migrates any existing records from legacy `vyrulix_community_db.json`.
-  2. Salted SHA-256 Password Hashing & 6-Digit Confirmation Flow:
+  2. PBKDF2-HMAC-SHA256 (120,000 Iterations) Password Hashing:
      - `register_user(username, password, email, confirm_password, role)` validates minimum
-       password length (`>= 6`), verifies `password == confirm_password`, generates a 6-digit
-       confirmation code, and stores salted `hashlib.sha256` password digests (`salt` + `sha256`).
+       password length (`>= 6`), verifies `password == confirm_password`, stores 120,000-iteration
+       `pbkdf2_hmac_sha256` password digests via `_hash_password_pbkdf2`, and activates the
+       local-first analyst session immediately upon sign-up.
      - `login_user(identifier, password)` authenticates by either username/handle or email
-       using constant-time `secrets.compare_digest`.
+       using constant-time `secrets.compare_digest` (with fallback to `_hash_password_legacy_sha256`).
   3. Reputation & Comment Synchronization:
      - `get_reputation_summary(sha256, sync_online=False)` returns vote tallies
        (`safe_count`, `suspicious_count`, `malicious_count`, `total_comments`, `consensus`).
      - `fetch_comments(sha256, sync_online=False)` and `append_comment(sha256, handle, verdict, comment, filename, role)`
-       manage per-hash analyst commentary with deterministic UUIDv5 deduplication.
+       manage per-hash analyst commentary with deterministic UUIDv5 deduplication and bounded
+       256 KB (`resp.read(262_144)`) / 50-item online sync protection.
 """
 
 from __future__ import annotations
@@ -27,33 +29,24 @@ import json
 import os
 import re
 import secrets
-import smtplib
 import tempfile
 import threading
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from email.message import EmailMessage
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 VALID_VERDICTS: List[str] = ["Safe", "Suspicious", "Malicious"]
 VYRULIX_APP_DIR = Path.home() / ".vyrulix"
 DEFAULT_DB_FILENAME = "community.json"
 LEGACY_DB_FILENAME = "vyrulix_community_db.json"
-VERIFICATION_OUTBOX_FILENAME = "verification_outbox.json"
 
-# Optional environment-isolated cloud & SMTP endpoints
+# Optional environment-isolated cloud endpoints
 ENV_API_PROXY_URL = os.environ.get("VYRULIX_API_PROXY_URL", "").strip().rstrip("/")
 ENV_SUPABASE_URL = os.environ.get("VYRULIX_SUPABASE_URL", "").strip().rstrip("/")
 ENV_SUPABASE_ANON_KEY = os.environ.get("VYRULIX_SUPABASE_ANON_KEY", "").strip()
-
-ENV_SMTP_HOST = os.environ.get("VYRULIX_SMTP_HOST", "").strip()
-ENV_SMTP_PORT = int(os.environ.get("VYRULIX_SMTP_PORT", "587") or 587)
-ENV_SMTP_USER = os.environ.get("VYRULIX_SMTP_USER", "").strip()
-ENV_SMTP_PASS = os.environ.get("VYRULIX_SMTP_PASS", "").strip()
-ENV_SMTP_FROM = os.environ.get("VYRULIX_SMTP_FROM", ENV_SMTP_USER or "noreply@vyrulix.local").strip()
 
 CONTROL_CHAR_REGEX = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 SHA256_HEX_REGEX = re.compile(r"^[0-9a-f]{64}$")
@@ -100,7 +93,6 @@ class CommunityManager:
         else:
             self.db_path = os.path.abspath(db_path)
 
-        self.outbox_path = str(Path(self.db_path).resolve().parent / VERIFICATION_OUTBOX_FILENAME)
         self._lock = threading.RLock()
         self._ensure_db_initialized()
 
@@ -179,17 +171,11 @@ class CommunityManager:
             raise
 
     # -------------------------------------------------------------------------
-    # User Authentication (`hashlib.sha256` + salt, 6-Digit Confirmation Code)
+    # User Authentication (`PBKDF2-HMAC-SHA256` 120,000 Iterations)
     # -------------------------------------------------------------------------
     @staticmethod
-    def _hash_password_sha256(password: str, salt: str) -> str:
-        """Hashes `password` with `salt` using `hashlib.sha256`."""
-        salted = f"{salt}:{password}".encode("utf-8")
-        return hashlib.sha256(salted).hexdigest()
-
-    @staticmethod
-    def _hash_password_legacy_pbkdf2(password: str, salt: str) -> str:
-        """Backward-compatible PBKDF2-HMAC-SHA256 verifier for older user records."""
+    def _hash_password_pbkdf2(password: str, salt: str) -> str:
+        """Primary password hasher using 120,000 iterations of PBKDF2-HMAC-SHA256."""
         dk = hashlib.pbkdf2_hmac(
             "sha256",
             password.encode("utf-8"),
@@ -198,69 +184,11 @@ class CommunityManager:
         )
         return dk.hex()
 
-    def send_confirmation_email(
-        self, email: str, username: str, confirmation_code: str
-    ) -> Tuple[bool, str]:
-        """
-        Dispatches a 6-digit account confirmation code via SMTP if configured,
-        and persists the confirmation record to `~/.vyrulix/verification_outbox.json`.
-        """
-        timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-        record = {
-            "email": email,
-            "username": username,
-            "confirmation_code": confirmation_code,
-            "timestamp": timestamp,
-            "delivery": "local_outbox",
-        }
-
-        smtp_sent = False
-        if ENV_SMTP_HOST and ENV_SMTP_USER and ENV_SMTP_PASS:
-            try:
-                msg = EmailMessage()
-                msg["Subject"] = f"Vyrulix Verification Code: {confirmation_code}"
-                msg["From"] = ENV_SMTP_FROM
-                msg["To"] = email
-                msg.set_content(
-                    f"Welcome to Vyrulix, {username}!\n\n"
-                    f"Your 6-digit account confirmation code is: {confirmation_code}\n"
-                    f"Generated at: {timestamp}\n"
-                )
-                with smtplib.SMTP(ENV_SMTP_HOST, ENV_SMTP_PORT, timeout=6.0) as server:
-                    server.starttls()
-                    server.login(ENV_SMTP_USER, ENV_SMTP_PASS)
-                    server.send_message(msg)
-                smtp_sent = True
-                record["delivery"] = "smtp"
-            except Exception:
-                smtp_sent = False
-
-        try:
-            outbox_dir = os.path.dirname(self.outbox_path) or "."
-            os.makedirs(outbox_dir, exist_ok=True)
-            existing: List[Dict[str, Any]] = []
-            if os.path.isfile(self.outbox_path):
-                try:
-                    with open(self.outbox_path, "r", encoding="utf-8") as f:
-                        loaded = json.load(f)
-                        if isinstance(loaded, list):
-                            existing = loaded
-                except Exception:
-                    existing = []
-            existing.append(record)
-            fd, tmp_out = tempfile.mkstemp(prefix=".vyrulix_outbox_", suffix=".tmp", dir=outbox_dir)
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(existing[-100:], f, indent=2)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp_out, self.outbox_path)
-        except Exception:
-            pass
-
-        return (
-            True,
-            "Sent via SMTP" if smtp_sent else f"Code {confirmation_code} logged to local outbox",
-        )
+    @staticmethod
+    def _hash_password_legacy_sha256(password: str, salt: str) -> str:
+        """Backward-compatible salted SHA-256 verifier for older user records."""
+        salted = f"{salt}:{password}".encode("utf-8")
+        return hashlib.sha256(salted).hexdigest()
 
     def register_user(
         self,
@@ -271,12 +199,12 @@ class CommunityManager:
         role: str = "Security Researcher",
     ) -> Dict[str, Any]:
         """
-        Registers a new analyst account in `~/.vyrulix/community.json`:
+        Registers a new local-first analyst account in `~/.vyrulix/community.json`:
           - Validates username format and email address.
           - Enforces minimum password length (>= 6 characters).
           - Verifies `password == confirm_password` when `confirm_password` is supplied.
-          - Generates a 6-digit confirmation code (`confirmation_code`).
-          - Stores salted `hashlib.sha256` password digest (`salt` + `password_hash`).
+          - Stores 120,000-iteration `pbkdf2_hmac_sha256` password digest (`salt` + `password_hash`).
+          - Immediately activates the session locally upon registration.
         """
         clean_user = sanitize_text(username, max_length=36, allow_newlines=False).lstrip("@").strip()
         if not clean_user or not USERNAME_SAFE_REGEX.fullmatch(clean_user):
@@ -313,8 +241,7 @@ class CommunityManager:
                     raise ValueError(f"Email '{clean_email}' is already registered.")
 
             salt = secrets.token_hex(16)
-            pw_hash = self._hash_password_sha256(password, salt)
-            confirmation_code = f"{secrets.randbelow(900000) + 100000:06d}"
+            pw_hash = self._hash_password_pbkdf2(password, salt)
             created_at = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
             handle = f"@{clean_user}"
 
@@ -325,9 +252,7 @@ class CommunityManager:
                 "role": clean_role,
                 "salt": salt,
                 "password_hash": pw_hash,
-                "hash_alg": "sha256_salted",
-                "confirmation_code": confirmation_code,
-                "verified": True,
+                "hash_alg": "pbkdf2_hmac_sha256",
                 "created_at": created_at,
             }
             users[user_key] = user_record
@@ -337,13 +262,11 @@ class CommunityManager:
                 "handle": handle,
                 "email": clean_email,
                 "role": clean_role,
-                "confirmation_code": confirmation_code,
                 "logged_in_at": created_at,
             }
             db["current_session"] = session
             self._write_db_unlocked(db)
 
-        self.send_confirmation_email(clean_email, clean_user, confirmation_code)
         return session
 
     def login_user(
@@ -385,13 +308,20 @@ class CommunityManager:
 
             salt = str(matched_record.get("salt", ""))
             expected_hash = str(matched_record.get("password_hash", ""))
-            hash_alg = str(matched_record.get("hash_alg", "sha256_salted"))
+            hash_alg = str(matched_record.get("hash_alg", "pbkdf2_hmac_sha256"))
 
-            cand_sha256 = self._hash_password_sha256(password, salt)
-            valid = secrets.compare_digest(cand_sha256, expected_hash)
-            if not valid and hash_alg != "sha256_salted":
-                cand_pbkdf2 = self._hash_password_legacy_pbkdf2(password, salt)
+            if hash_alg == "pbkdf2_hmac_sha256":
+                cand_pbkdf2 = self._hash_password_pbkdf2(password, salt)
                 valid = secrets.compare_digest(cand_pbkdf2, expected_hash)
+                if not valid:
+                    cand_sha256 = self._hash_password_legacy_sha256(password, salt)
+                    valid = secrets.compare_digest(cand_sha256, expected_hash)
+            else:
+                cand_sha256 = self._hash_password_legacy_sha256(password, salt)
+                valid = secrets.compare_digest(cand_sha256, expected_hash)
+                if not valid:
+                    cand_pbkdf2 = self._hash_password_pbkdf2(password, salt)
+                    valid = secrets.compare_digest(cand_pbkdf2, expected_hash)
 
             if not valid:
                 raise ValueError("Invalid password. Please try again.")
@@ -566,14 +496,15 @@ class CommunityManager:
         url = f"{ENV_API_PROXY_URL}/comments?sha256={urllib.parse.quote(norm_hash)}"
         req = urllib.request.Request(
             url,
-            headers={"Accept": "application/json", "User-Agent": "Vyrulix-Community/1.0"},
+            headers={"Accept": "application/json", "User-Agent": "Vyrulix-Community/1.1"},
             method="GET",
         )
         try:
             with urllib.request.urlopen(req, timeout=4.0) as resp:
-                remote_items = json.loads(resp.read().decode("utf-8", errors="replace"))
+                remote_items = json.loads(resp.read(262_144).decode("utf-8", errors="replace"))
             if not isinstance(remote_items, list):
                 return
+            remote_items = remote_items[:50]
             with self._lock:
                 db = self._read_db_unlocked()
                 samples = db.setdefault("samples", {})
@@ -583,7 +514,7 @@ class CommunityManager:
                 comments_list: List[Dict[str, Any]] = sample_rec.setdefault("comments", [])
                 seen_ids = {str(c.get("id")) for c in comments_list if isinstance(c, dict)}
                 changed = False
-                for r_item in remote_items[:50]:
+                for r_item in remote_items:
                     if not isinstance(r_item, dict):
                         continue
                     cid = sanitize_text(str(r_item.get("id", "")), max_length=64, allow_newlines=False)

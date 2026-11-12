@@ -483,7 +483,7 @@ class VyrulixApp(ctk.CTk):
     def __init__(self) -> None:
         super().__init__(fg_color=VT_BG_MAIN)
 
-        self.title("Vyrulix v1.0 // Malware & Threat Intelligence Analyzer")
+        self.title("Vyrulix v1.1 // Malware & Threat Intelligence Analyzer")
         self.geometry("1280x850")
         self.minsize(1060, 720)
 
@@ -1506,7 +1506,8 @@ class VyrulixApp(ctk.CTk):
                 on_new_file_callback=lambda path: self.ui_queue.put(("AUTO_FILE", path)),
                 mode=self.file_filter_mode,
             )
-            if watcher.start():
+            ok, msg = watcher.start()
+            if ok:
                 self.auto_watcher = watcher
                 self.autoscan_nav_btn.configure(
                     text="⚡ Auto-Scan: ON",
@@ -1522,6 +1523,12 @@ class VyrulixApp(ctk.CTk):
                 self.status_label.configure(
                     text=f"⚡ Auto-Scan active: watching {self.watched_folder} for new files...",
                     text_color=VT_GREEN,
+                )
+            else:
+                self.auto_watcher = None
+                self.status_label.configure(
+                    text=msg,
+                    text_color=VT_RED,
                 )
         apply_rounded_hwnd_clip(self.autoscan_nav_btn, force=True)
         apply_rounded_hwnd_clip(self.home_autoscan_btn, force=True)
@@ -1963,7 +1970,7 @@ class VyrulixApp(ctk.CTk):
 
         self.community_banner = ctk.CTkLabel(
             top_bar,
-            text="Community Intelligence (Local-First)  •  Scan an item to view or share verdicts",
+            text="Community Intelligence (Stored locally in ~/.vyrulix/community.json unless a cloud proxy is configured)  •  Scan an item to view or share verdicts",
             font=ctk.CTkFont(size=14, weight="bold"),
             text_color="#60A5FA",
             anchor="w",
@@ -2103,7 +2110,7 @@ class VyrulixApp(ctk.CTk):
 
         sub_lbl = ctk.CTkLabel(
             auth_card,
-            text="Sign in with your username or email, or register with 6-digit email confirmation.",
+            text="Sign in with your username or email, or create a local-first analyst account.",
             font=ctk.CTkFont(size=13),
             text_color=VT_TEXT_MUTED,
         )
@@ -2333,7 +2340,7 @@ class VyrulixApp(ctk.CTk):
             self.auth_role_entry.insert(0, "Security Researcher")
             self.auth_role_entry.pack(fill="x", pady=(0, 8))
 
-        action_text = "Sign In" if selected == "Sign In" else "Create Account & Send 6-Digit Code"
+        action_text = "Sign In" if selected == "Sign In" else "Create Account"
         submit_btn = ctk.CTkButton(
             self.auth_form_frame,
             text=action_text,
@@ -2363,9 +2370,8 @@ class VyrulixApp(ctk.CTk):
                     confirm_password=confirm_pw,
                     role=role,
                 )
-                code = session.get("confirmation_code", "")
                 self.status_label.configure(
-                    text=f"✔ Account created for {session['handle']} (6-digit confirmation code: {code})",
+                    text=f"✔ Account created for {session['handle']} ({session['role']})",
                     text_color=VT_GREEN,
                 )
             else:
@@ -3256,11 +3262,16 @@ class VyrulixApp(ctk.CTk):
         self.community_mini_badge.configure(
             text=f"Community: {summary['total_comments']} vote(s)"
         )
+        storage_mode = (
+            "Cloud Proxy Active"
+            if os.environ.get("VYRULIX_API_PROXY_URL", "").strip()
+            else "Local: ~/.vyrulix/community.json (unless cloud proxy configured)"
+        )
         self.community_banner.configure(
             text=(
                 f"Comments ({summary['total_comments']})  •  {summary['consensus']}  "
                 f"[ Safe: {summary['safe_count']} | Suspicious: {summary['suspicious_count']} | "
-                f"Malicious: {summary['malicious_count']} ]"
+                f"Malicious: {summary['malicious_count']} ]  •  {storage_mode}"
             )
         )
 
@@ -3421,7 +3432,7 @@ class VyrulixApp(ctk.CTk):
 
         def _worker() -> None:
             updated = self.scanner.detonate_in_windows_sandbox(
-                target_report, timeout_sec=35, status_callback=_status_cb
+                target_report, timeout_sec=70, status_callback=_status_cb
             )
             if not self.is_closing:
                 self.ui_queue.put(("SANDBOX_DONE", updated))
