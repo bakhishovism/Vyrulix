@@ -1,8 +1,9 @@
 """
 Vyrulix v1.1 - Canonical Spec Normalization & PyInstaller 6.x Builder (build_vyrulix.py)
 Rebranded to Vyrulix (v1.1):
-  1. Normalizes legacy or misnamed project files (`scanner_2.py` -> `scanner.py`,
-     `main_2.py` -> `main.py`, `community_2.py` -> `community.py`) prior to build.
+  1. Normalizes legacy or browser-renamed project files (`scanner_3.py` / `scanner_2.py` -> `scanner.py`,
+     `main_3.py` / `main_2.py` -> `main.py`, `community_3.py` / `community_2.py` -> `community.py`,
+     `build_vyrulix_3.py` / `build_vyrulix_2.py` -> `build_vyrulix.py`) prior to build.
   2. Verifies that `main.py`, `scanner.py`, `community.py`, and `rules/vyrulix_default.yar`
      are present and valid.
   3. Generates `Vyrulix.spec` targeting the canonical entry point `main.py` and bundling
@@ -155,13 +156,18 @@ coll = COLLECT(
 
 def normalize_project_filenames(project_dir: Path) -> None:
     """
-    Normalizes any suffixed or browser-renamed project files (`scanner_2.py`, `main_2.py`,
-    `community_2.py`, `vyrulix.text`) to their canonical names.
+    Normalizes any suffixed or browser-renamed project files (`scanner_3.py`, `scanner_2.py`,
+    `main_3.py`, `main_2.py`, `community_3.py`, `community_2.py`, `build_vyrulix_3.py`)
+    to their canonical names before compiling.
     """
     normalization_map = [
-        ("scanner.py", ("scanner_2.py", "scanner_1.py", "scanner.py.txt")),
-        ("main.py", ("main_2.py", "main_1.py", "main.py.txt")),
-        ("community.py", ("community_2.py", "community_1.py", "community.py.txt")),
+        ("scanner.py", ("scanner_3.py", "scanner_2.py", "scanner_1.py", "scanner.py.txt")),
+        ("main.py", ("main_3.py", "main_2.py", "main_1.py", "main.py.txt")),
+        ("community.py", ("community_3.py", "community_2.py", "community_1.py", "community.py.txt")),
+        (
+            "build_vyrulix.py",
+            ("build_vyrulix_3.py", "build_vyrulix_2.py", "build_vyrulix_1.py", "build_vyrulix.py.txt"),
+        ),
     ]
     for canonical_name, aliases in normalization_map:
         canonical_path = project_dir / canonical_name
